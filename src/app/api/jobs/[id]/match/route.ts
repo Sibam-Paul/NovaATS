@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getSupabaseClient } from '@/lib/supabase';
-import { generateEmbedding } from '@/lib/gemini';
+import { generateEmbedding } from '@/lib/openai';
 
 export async function POST(
   _request: NextRequest,

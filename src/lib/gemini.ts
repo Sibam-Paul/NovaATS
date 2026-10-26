@@ -28,6 +28,42 @@ export function getGeminiClient(): GoogleGenAI {
 }
 
 /**
+ * Exponential Backoff Retry Helper:
+ * Retries an API call up to `retries` times on 503 (Unavailable / High Demand) errors.
+ */
+export async function withRetry<T>(
+  fn: () => Promise<T>,
+  retries = 3,
+  delayMs = 2000
+): Promise<T> {
+  try {
+    return await fn();
+  } catch (error: unknown) {
+    const err = error as { code?: number; status?: string; message?: string };
+    const errorMsg = err?.message || String(error);
+    const errorCode = err?.code;
+    const errorStatus = err?.status;
+
+    const is503Error =
+      errorCode === 503 ||
+      errorStatus === 'UNAVAILABLE' ||
+      errorMsg.includes('503') ||
+      errorMsg.toLowerCase().includes('high demand') ||
+      errorMsg.toLowerCase().includes('unavailable');
+
+    if (is503Error && retries > 0) {
+      console.warn(
+        `[Google API 503 High Demand] Retrying in ${delayMs}ms... (${retries} attempts left)`
+      );
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      return withRetry(fn, retries - 1, delayMs * 2);
+    }
+
+    throw error;
+  }
+}
+
+/**
  * Locks the vector output strictly to 768 dimensions to match the Supabase vector(768) schema.
  */
 function enforce768Dimensions(vector: number[]): number[] {
@@ -49,7 +85,6 @@ function enforce768Dimensions(vector: number[]): number[] {
 export async function generateEmbedding(text: string): Promise<number[]> {
   const ai = getGeminiClient();
 
-  // User-configured override via env, followed by standard active models and fallbacks
   const envModel = process.env.GEMINI_EMBEDDING_MODEL;
   const candidateModels = [
     ...(envModel ? [envModel] : []),
@@ -62,18 +97,18 @@ export async function generateEmbedding(text: string): Promise<number[]> {
 
   for (const model of candidateModels) {
     try {
-      // Ensure no 'models/' prefix is accidentally duplicated
       const cleanModelName = model.replace(/^models\//, '');
 
-      const response = await ai.models.embedContent({
-        model: cleanModelName,
-        contents: text,
-        config: {
-          outputDimensionality: 768,
-        },
+      const response = await withRetry(async () => {
+        return await ai.models.embedContent({
+          model: cleanModelName,
+          contents: text,
+          config: {
+            outputDimensionality: 768,
+          },
+        });
       });
 
-      // Handle both SingleEmbedContentResponse and EmbedContentResponse shapes
       const res = response as unknown as {
         embedding?: { values?: number[] };
         embeddings?: Array<{ values?: number[] }>;
@@ -95,7 +130,8 @@ export async function generateEmbedding(text: string): Promise<number[]> {
 }
 
 /**
- * Parses raw resume text into structured JSON using Gemini 1.5 Flash with a strict system prompt.
+ * Parses raw resume text into structured JSON using Gemini 3.8 Flash with a strict system prompt.
+ * Uses 'gemini-3.8-flash' without hardcoded 'models/' prefixes.
  */
 export async function parseResumeWithGemini(rawResumeText: string): Promise<ParsedResume> {
   const ai = getGeminiClient();
@@ -127,29 +163,34 @@ Strict requirements:
 4. "experience": An array of structured prior employment entries.
 5. "summary": A concise narrative summary of the candidate's profile.`;
 
-  const response = await ai.models.generateContent({
-    model: process.env.GEMINI_MODEL || 'gemini-1.5-flash',
-    contents: `Extract the following resume text:\n\n${rawResumeText}`,
-    config: {
-      systemInstruction,
-      responseMimeType: 'application/json',
-      temperature: 0.1,
-    },
+  const modelName = (process.env.GEMINI_MODEL || 'gemini-3.8-flash').replace(/^models\//, '');
+
+  const response = await withRetry(async () => {
+    return await ai.models.generateContent({
+      model: modelName,
+      contents: `Extract the following resume text:\n\n${rawResumeText}`,
+      config: {
+        systemInstruction,
+        responseMimeType: 'application/json',
+        temperature: 0.1,
+      },
+    });
   });
 
   const rawText = response.text;
   if (!rawText) {
-    throw new Error('Received empty response from Gemini 1.5 Flash.');
+    throw new Error('Received empty response from Gemini.');
   }
 
-  // Clean any markdown ticks just in case
   const cleaned = rawText.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
 
   let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(cleaned);
   } catch (err) {
-    throw new Error(`Failed to parse Gemini output as JSON: ${err instanceof Error ? err.message : String(err)}\nRaw output: ${cleaned}`);
+    throw new Error(
+      `Failed to parse Gemini output as JSON: ${err instanceof Error ? err.message : String(err)}\nRaw output: ${cleaned}`
+    );
   }
 
   return {

@@ -1,6 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
+import OpenAI from 'openai';
 import { getSupabaseClient } from '@/lib/supabase';
-import { generateEmbedding } from '@/lib/gemini';
+
+function getOpenAIClient(): OpenAI {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    throw new Error('OPENAI_API_KEY is not configured in environment variables.');
+  }
+  return new OpenAI({ apiKey });
+}
 
 export async function GET() {
   try {
@@ -47,10 +55,20 @@ export async function POST(request: NextRequest) {
       ? `Job Title: ${title.trim()}\n\nDescription:\n${description.trim()}\n\nRequirements:\n${requirements.trim()}`
       : `Job Title: ${title.trim()}\n\nDescription:\n${description.trim()}`;
 
-    // Call Gemini API to generate 768-dim vector embedding using text-embedding-004
-    const embedding = await generateEmbedding(textToEmbed);
+    // 1. Generate 768-dimensional embedding using OpenAI text-embedding-3-small
+    const openai = getOpenAIClient();
+    const embeddingResponse = await openai.embeddings.create({
+      model: 'text-embedding-3-small',
+      input: textToEmbed,
+      dimensions: 768, // Strictly locked to 768 dimensions for Supabase vector(768)
+    });
 
-    // Insert row into Supabase
+    const embedding = embeddingResponse.data[0]?.embedding;
+    if (!embedding || embedding.length !== 768) {
+      throw new Error(`Failed to generate 768-dim embedding: received ${embedding?.length} dimensions.`);
+    }
+
+    // 2. Insert row into Supabase
     const supabase = getSupabaseClient();
     const { data: job, error: insertError } = await supabase
       .from('jobs')
@@ -84,4 +102,3 @@ export async function POST(request: NextRequest) {
     );
   }
 }
-

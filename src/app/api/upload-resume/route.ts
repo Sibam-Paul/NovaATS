@@ -1,7 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server';
+import pdf from 'pdf-parse';
+import OpenAI from 'openai';
 import { getSupabaseClient } from '@/lib/supabase';
-import { extractTextFromPdf } from '@/lib/pdf';
-import { generateEmbedding, parseResumeWithGemini } from '@/lib/gemini';
+import { ParsedResume } from '@/lib/openai';
+
+function getOpenAIClient(): OpenAI {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    throw new Error('OPENAI_API_KEY is not configured in environment variables.');
+  }
+  return new OpenAI({ apiKey });
+}
 
 export async function POST(request: NextRequest) {
   try {
@@ -32,12 +41,13 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // 1. Extract raw text from the PDF
+    // 1. Extract raw text from the uploaded PDF document using pdf-parse
     const arrayBuffer = await file.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
-    const rawText = await extractTextFromPdf(buffer);
+    const pdfData = await pdf(buffer);
+    const rawText = pdfData.text ? pdfData.text.trim() : '';
 
-    if (!rawText || rawText.trim().length === 0) {
+    if (!rawText || rawText.length === 0) {
       return NextResponse.json(
         {
           error:
@@ -47,10 +57,74 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // 2. Pass the raw text to Gemini 1.5 Flash with strict system prompt to output structured JSON
-    const parsedResume = await parseResumeWithGemini(rawText);
+    const openai = getOpenAIClient();
 
-    // 3. Build a structured summary of the candidate to pass to the embedding model
+    // 2. Structured Extraction using OpenAI gpt-4o-mini with response_format: { type: "json_object" }
+    const systemInstruction = `You are an expert ATS (Applicant Tracking System) resume extraction engine.
+Analyze the provided resume text thoroughly and extract candidate data into a strict JSON object.
+You MUST output ONLY a valid JSON object matching the following schema:
+
+{
+  "name": "Candidate Full Name",
+  "email": "candidate.email@example.com (or null if not found)",
+  "phone": "+1 234 567 8900 (or null if not found)",
+  "skills": ["Skill 1", "Skill 2", "Skill 3"],
+  "experience": [
+    {
+      "company": "Company Name",
+      "role": "Job Title",
+      "duration": "Dates/Duration (e.g. Jan 2022 - Present)",
+      "summary": "Key achievements and responsibilities"
+    }
+  ],
+  "summary": "A concise professional summary highlighting the candidate's core domain expertise, years of experience, and primary strengths."
+}
+
+Strict requirements:
+1. "name": Extract the candidate's actual name. If undetectable, output "Unknown Candidate".
+2. "email" & "phone": Must be strings or null if absent.
+3. "skills": An array of technical and professional skills (languages, frameworks, tools, methodologies).
+4. "experience": An array of structured prior employment entries.
+5. "summary": A concise narrative summary of the candidate's profile.`;
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: systemInstruction },
+        { role: 'user', content: `Extract the following resume text:\n\n${rawText}` },
+      ],
+      response_format: { type: 'json_object' },
+      temperature: 0.1,
+    });
+
+    const rawJson = completion.choices[0]?.message?.content;
+    if (!rawJson) {
+      throw new Error('Received empty response from OpenAI gpt-4o-mini.');
+    }
+
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(rawJson);
+    } catch (err) {
+      throw new Error(
+        `Failed to parse OpenAI output as JSON: ${err instanceof Error ? err.message : String(err)}\nRaw output: ${rawJson}`
+      );
+    }
+
+    const parsedResume: ParsedResume = {
+      name: typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name.trim() : 'Unknown Candidate',
+      email: typeof parsed.email === 'string' && parsed.email.trim() ? parsed.email.trim() : null,
+      phone: typeof parsed.phone === 'string' && parsed.phone.trim() ? parsed.phone.trim() : null,
+      skills: Array.isArray(parsed.skills)
+        ? parsed.skills.filter((s): s is string => typeof s === 'string')
+        : [],
+      experience: Array.isArray(parsed.experience)
+        ? (parsed.experience as ParsedResume['experience'])
+        : [],
+      summary: typeof parsed.summary === 'string' ? parsed.summary.trim() : '',
+    };
+
+    // 3. Build a structured summary of the candidate for semantic embedding
     const summaryParts: string[] = [
       `Candidate Name: ${parsedResume.name}`,
     ];
@@ -75,8 +149,17 @@ export async function POST(request: NextRequest) {
 
     const structuredSummary = summaryParts.join('\n\n');
 
-    // 4. Pass that structured summary to the Gemini embedding model (text-embedding-004)
-    const embedding = await generateEmbedding(structuredSummary);
+    // 4. Generate 768-dim vector embedding using OpenAI text-embedding-3-small
+    const embeddingResponse = await openai.embeddings.create({
+      model: 'text-embedding-3-small',
+      input: structuredSummary,
+      dimensions: 768, // Explicitly locked to 768 dimensions for Supabase vector(768)
+    });
+
+    const embedding = embeddingResponse.data[0]?.embedding;
+    if (!embedding || embedding.length !== 768) {
+      throw new Error(`OpenAI embedding failed or returned invalid dimension: ${embedding?.length}`);
+    }
 
     // 5. Save parsed JSON, raw text, and vector embedding into candidates table in Supabase
     const supabase = getSupabaseClient();
